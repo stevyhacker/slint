@@ -9,6 +9,8 @@ The [image cache](super::cache) holds what's parsed or decoded from that data.
 #[cfg(any(feature = "svg", feature = "image-decoders"))]
 use super::EncodedData;
 use super::{ImageCacheKey, IntSize};
+#[cfg(feature = "std")]
+use crate::SlintContext;
 use crate::slice::Slice;
 #[cfg(feature = "std")]
 use alloc::rc::Rc;
@@ -23,19 +25,19 @@ pub enum EncodedImageKind {
     Svg,
     /// An image with more than one frame.
     Animated,
-    /// An image that the browser decodes.
-    Html,
 }
 
-/// An image that's decoded, parsed, or handed to the browser when it's needed.
+/// An image that's decoded or parsed when it's needed.
+///
+/// Functions that take a `context` share what they make through its image cache,
+/// or don't cache it without one.
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct EncodedImage {
     source: ImageCacheKey,
     kind: EncodedImageKind,
-    /// The file extension of the format, or the MIME type for the browser.
+    /// The file extension of the format.
     format: Slice<'static, u8>,
-    /// The size read when loading, unknown for [`EncodedImageKind::Html`].
     size: IntSize,
 }
 
@@ -56,22 +58,9 @@ impl EncodedImage {
         self.kind
     }
 
-    /// Returns the size in pixels, or zero while the browser hasn't loaded the image.
+    /// Returns the size in pixels.
     pub fn size(&self) -> IntSize {
-        #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std"))]
-        if self.kind == EncodedImageKind::Html {
-            return self.html_image().and_then(|image| image.size()).unwrap_or_default();
-        }
         self.size
-    }
-
-    /// Returns true for an SVG, including one that the browser renders.
-    pub fn is_svg(&self) -> bool {
-        match self.kind {
-            EncodedImageKind::Svg => true,
-            EncodedImageKind::Html => self.format.as_slice() == b"image/svg+xml",
-            _ => false,
-        }
     }
 
     /// Renders the image: an SVG at `target_size_for_scalable_source` or its own size,
@@ -80,24 +69,32 @@ impl EncodedImage {
     pub(crate) fn render_to_buffer(
         &self,
         _target_size_for_scalable_source: Option<euclid::Size2D<u32, crate::lengths::PhysicalPx>>,
+        context: Option<&SlintContext>,
     ) -> Option<super::SharedImageBuffer> {
         match self.kind {
-            EncodedImageKind::Raster => self.decode_shared().map(|buffer| (*buffer).clone()),
+            EncodedImageKind::Raster => {
+                self.decode_shared_in(context).map(|buffer| (*buffer).clone())
+            }
             #[cfg(feature = "svg")]
-            EncodedImageKind::Svg => match self.svg()?.render(_target_size_for_scalable_source) {
-                Ok(buffer) => Some(buffer),
-                // A 0x0 image is just empty.
-                Err(resvg::usvg::Error::InvalidSize) => None,
-                Err(err) => {
-                    std::eprintln!("Error rendering SVG: {err}");
-                    None
+            EncodedImageKind::Svg => {
+                match self.svg_in(context)?.render(_target_size_for_scalable_source) {
+                    Ok(buffer) => Some(buffer),
+                    // A 0x0 image is just empty.
+                    Err(resvg::usvg::Error::InvalidSize) => None,
+                    Err(err) => {
+                        std::eprintln!("Error rendering SVG: {err}");
+                        None
+                    }
                 }
-            },
+            }
             #[cfg(all(
                 feature = "image-decoders",
                 any(not(target_arch = "wasm32"), target_os = "emscripten")
             ))]
-            EncodedImageKind::Animated => Some(self.animation()?.first_frame_buffer().clone()),
+            EncodedImageKind::Animated => {
+                Some(self.animation_in(context)?.first_frame_buffer().clone())
+            }
+            #[allow(unreachable_patterns)]
             _ => None,
         }
     }
@@ -116,23 +113,36 @@ impl EncodedImage {
         None
     }
 
-    /// Returns the decoded still image, shared through the image cache.
+    /// Returns the decoded still image.
     #[cfg(feature = "std")]
-    pub(crate) fn decode_shared(&self) -> Option<Rc<super::SharedImageBuffer>> {
-        super::cache::cached(&self.source, || {
+    pub fn decode_shared(&self, context: &SlintContext) -> Option<Rc<super::SharedImageBuffer>> {
+        self.decode_shared_in(Some(context))
+    }
+
+    #[cfg(feature = "std")]
+    fn decode_shared_in(
+        &self,
+        context: Option<&SlintContext>,
+    ) -> Option<Rc<super::SharedImageBuffer>> {
+        super::cache::cached_in(context, &self.source, || {
             let buffer = self.decode()?;
             let weight = super::cache::buffer_weight(&buffer);
             Some((buffer, weight))
         })
     }
 
-    /// Returns the parsed SVG document, shared through the image cache.
+    /// Returns the parsed SVG document.
     #[cfg(feature = "svg")]
-    pub fn svg(&self) -> Option<Rc<super::ParsedSVG>> {
+    pub fn svg(&self, context: &SlintContext) -> Option<Rc<super::ParsedSVG>> {
+        self.svg_in(Some(context))
+    }
+
+    #[cfg(feature = "svg")]
+    fn svg_in(&self, context: Option<&SlintContext>) -> Option<Rc<super::ParsedSVG>> {
         if self.kind != EncodedImageKind::Svg {
             return None;
         }
-        super::cache::cached(&self.source, || {
+        super::cache::cached_in(context, &self.source, || {
             let svg = super::svg::load_from_data(&self.read()?)
                 .map_err(|err| crate::debug_log!("Error loading SVG: {err}"))
                 .ok()?;
@@ -141,44 +151,33 @@ impl EncodedImage {
         })
     }
 
-    /// Returns the animation, shared through the image cache.
+    /// Returns the animation.
     #[cfg(all(
         feature = "image-decoders",
         any(not(target_arch = "wasm32"), target_os = "emscripten")
     ))]
-    pub fn animation(&self) -> Option<Rc<super::AnimatedImage>> {
+    pub fn animation(&self, context: &SlintContext) -> Option<Rc<super::AnimatedImage>> {
+        self.animation_in(Some(context))
+    }
+
+    /// Like [`Self::animation`], and without a context, nothing is cached.
+    #[cfg(all(
+        feature = "image-decoders",
+        any(not(target_arch = "wasm32"), target_os = "emscripten")
+    ))]
+    pub(crate) fn animation_in(
+        &self,
+        context: Option<&SlintContext>,
+    ) -> Option<Rc<super::AnimatedImage>> {
         if self.kind != EncodedImageKind::Animated {
             return None;
         }
-        super::cache::cached(&self.source, || {
+        super::cache::cached_in(context, &self.source, || {
             let animation = super::animated::load(self.read()?, image_format(&self.format)?)
                 .map_err(|err| crate::debug_log!("Error decoding animation: {err}"))
                 .ok()??;
             let weight = animation.weight_in_bytes();
             Some((animation, weight))
-        })
-    }
-
-    /// Returns the `<img>` element that the browser loads the image with,
-    /// shared through the image cache.
-    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std"))]
-    pub fn html_image(&self) -> Option<Rc<super::HTMLImage>> {
-        if self.kind != EncodedImageKind::Html {
-            return None;
-        }
-        // The browser keeps its own cache; this only bounds the number of DOM elements.
-        const WEIGHT: usize = 512;
-        super::cache::cached(&self.source, || {
-            let mime_type = core::str::from_utf8(self.format.as_slice()).ok()?;
-            let image = match &self.source {
-                ImageCacheKey::URL(url) => super::HTMLImage::new(url),
-                ImageCacheKey::EmbeddedData(data) => {
-                    super::HTMLImage::new_from_data(data.as_slice(), mime_type)?
-                }
-                ImageCacheKey::Data(data) => super::HTMLImage::new_from_data(data, mime_type)?,
-                _ => return None,
-            };
-            Some((image, WEIGHT))
         })
     }
 
@@ -238,16 +237,15 @@ fn looks_like_svg(data: &[u8]) -> bool {
 }
 
 /// Returns the image of `key`, loading it with `load` unless an earlier load is in the cache.
-#[cfg(all(
-    feature = "std",
-    any(feature = "image-decoders", all(target_arch = "wasm32", not(target_os = "emscripten")))
-))]
+#[cfg(feature = "image-decoders")]
 fn load_cached(
+    context: Option<&SlintContext>,
     key: ImageCacheKey,
     load: impl FnOnce() -> Option<EncodedImage>,
 ) -> Option<super::ImageInner> {
-    let encoded =
-        super::cache::cached(&key, || Some((load()?, core::mem::size_of::<EncodedImage>())))?;
+    let encoded = super::cache::cached_in(context, &key, || {
+        Some((load()?, core::mem::size_of::<EncodedImage>()))
+    })?;
     Some(super::ImageInner::Encoded(EncodedImage::clone(&encoded)))
 }
 
@@ -280,13 +278,17 @@ fn load_raster(
     feature = "svg",
     any(not(target_arch = "wasm32"), target_os = "emscripten", feature = "image-decoders")
 ))]
-fn load_svg(source: ImageCacheKey, data: &[u8]) -> Option<EncodedImage> {
+fn load_svg(
+    context: Option<&SlintContext>,
+    source: ImageCacheKey,
+    data: &[u8],
+) -> Option<EncodedImage> {
     let svg = super::svg::load_from_data(data)
         .map_err(|err| crate::debug_log!("Error loading SVG: {err}"))
         .ok()?;
     let size = svg.size();
     let weight = svg.weight_in_bytes();
-    super::cache::cached(&source, || Some((svg, weight)));
+    super::cache::cached_in(context, &source, || Some((svg, weight)));
     Some(EncodedImage {
         source,
         kind: EncodedImageKind::Svg,
@@ -302,16 +304,21 @@ fn load_svg(source: ImageCacheKey, data: &[u8]) -> Option<EncodedImage> {
 ))]
 pub(crate) fn load_svg_from_data(data: &[u8]) -> Option<super::ImageInner> {
     let source = ImageCacheKey::Data(crate::SharedVector::from_slice(data));
-    load_svg(source, data).map(super::ImageInner::Encoded)
+    load_svg(None, source, data).map(super::ImageInner::Encoded)
 }
 
 /// Loads `data`, the encoded data of `source`, given the file extension of its format, if known.
 /// The cache keeps what's parsed or decoded to tell an SVG or animation's size.
 #[cfg(feature = "image-decoders")]
-fn load(source: ImageCacheKey, data: EncodedData, extension: &[u8]) -> Option<EncodedImage> {
+fn load(
+    context: Option<&SlintContext>,
+    source: ImageCacheKey,
+    data: EncodedData,
+    extension: &[u8],
+) -> Option<EncodedImage> {
     if is_svg(&data, extension) {
         #[cfg(feature = "svg")]
-        return load_svg(source, &data);
+        return load_svg(context, source, &data);
         #[cfg(not(feature = "svg"))]
         return None;
     }
@@ -325,7 +332,7 @@ fn load(source: ImageCacheKey, data: EncodedData, extension: &[u8]) -> Option<En
         Ok(Some(animation)) => {
             let size = animation.size();
             let weight = animation.weight_in_bytes();
-            super::cache::cached(&source, || Some((animation, weight)));
+            super::cache::cached_in(context, &source, || Some((animation, weight)));
             return Some(EncodedImage {
                 source,
                 kind: EncodedImageKind::Animated,
@@ -341,12 +348,15 @@ fn load(source: ImageCacheKey, data: EncodedData, extension: &[u8]) -> Option<En
 
 /// Loads the image at `path`, sharing it with other loads of the same file.
 #[cfg(all(feature = "image-decoders", any(not(target_arch = "wasm32"), target_os = "emscripten")))]
-pub(crate) fn load_from_path(path: &crate::SharedString) -> Option<super::ImageInner> {
+pub(crate) fn load_from_path(
+    context: Option<&SlintContext>,
+    path: &crate::SharedString,
+) -> Option<super::ImageInner> {
     if path.is_empty() {
         return None;
     }
     let source = ImageCacheKey::Path(super::CachedPath::new(path.as_str()));
-    load_cached(source.clone(), || {
+    load_cached(context, source.clone(), || {
         let extension = std::path::Path::new(path.as_str())
             .extension()
             .map_or(&b""[..], |extension| extension.as_encoded_bytes());
@@ -354,7 +364,8 @@ pub(crate) fn load_from_path(path: &crate::SharedString) -> Option<super::ImageI
         let needs_data = is_svg(&[], extension) || format.is_none_or(may_animate);
         let loaded = if needs_data {
             std::fs::read(path.as_str()).map(|data| {
-                load(source, EncodedData::Shared(crate::SharedVector::from_slice(&data)), extension)
+                let data = EncodedData::Shared(crate::SharedVector::from_slice(&data));
+                load(context, source, data, extension)
             })
         } else {
             std::fs::File::open(path.as_str())
@@ -371,14 +382,17 @@ pub(crate) fn load_from_path(path: &crate::SharedString) -> Option<super::ImageI
     all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
 ))]
 pub(crate) fn load_from_static_data(
+    context: Option<&SlintContext>,
     data: &'static [u8],
     extension: &[u8],
 ) -> Option<super::ImageInner> {
     let source = ImageCacheKey::EmbeddedData(Slice::from_slice(data));
     #[cfg(feature = "image-decoders")]
-    return load_cached(source.clone(), || load(source, EncodedData::Static(data), extension));
+    return load_cached(context, source.clone(), || {
+        load(context, source, EncodedData::Static(data), extension)
+    });
     #[cfg(not(feature = "image-decoders"))]
-    return load_cached(source.clone(), || load_html(source, data, extension));
+    return load_html_cached(context, &source, || load_html(data, extension));
 }
 
 /// Loads `data`, copied only if it's an SVG or an animation, which are parsed again from it.
@@ -395,67 +409,74 @@ pub(crate) fn load_from_data(data: &[u8], extension: &[u8]) -> Option<super::Ima
             return decode_data(data, format?).map(super::ImageInner::EmbeddedImage);
         }
         let shared = crate::SharedVector::from_slice(data);
-        let encoded =
-            load(ImageCacheKey::Data(shared.clone()), EncodedData::Shared(shared), extension)?;
+        let encoded = load(
+            None,
+            ImageCacheKey::Data(shared.clone()),
+            EncodedData::Shared(shared),
+            extension,
+        )?;
         if encoded.kind == EncodedImageKind::Raster {
             return encoded.decode().map(super::ImageInner::EmbeddedImage);
         }
         Some(super::ImageInner::Encoded(encoded))
     }
     #[cfg(not(feature = "image-decoders"))]
-    load_html(ImageCacheKey::Data(crate::SharedVector::from_slice(data)), data, extension)
-        .map(super::ImageInner::Encoded)
+    load_html(data, extension).map(|image| super::ImageInner::HTMLImage(Rc::new(image)))
 }
 
-/// Loads the payload of a data URI. The browser loads asynchronously, so all the loads
-/// of the same URI share one image and its loading state.
+/// Loads the payload of a data URI. The browser loads asynchronously, so the loads
+/// of the same URI share one image and its loading state through the cache of `context`.
 #[cfg(any(
     feature = "image-decoders",
     all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
 ))]
 pub(crate) fn load_from_data_uri(
+    context: &SlintContext,
     uri: &str,
     data: &[u8],
     extension: &[u8],
 ) -> Option<super::ImageInner> {
     #[cfg(feature = "image-decoders")]
     {
-        let _ = uri;
+        let _ = (context, uri);
         load_from_data(data, extension)
     }
     #[cfg(not(feature = "image-decoders"))]
-    load_cached(ImageCacheKey::URL(uri.into()), || {
-        load_html(ImageCacheKey::Data(crate::SharedVector::from_slice(data)), data, extension)
-    })
+    load_html_cached(Some(context), &ImageCacheKey::URL(uri.into()), || load_html(data, extension))
 }
 
 /// Loads an image that the browser fetches from `url`.
 #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std"))]
-pub(crate) fn load_as_html_image(url: &str) -> Option<super::ImageInner> {
+pub(crate) fn load_as_html_image(context: &SlintContext, url: &str) -> Option<super::ImageInner> {
     if url.is_empty() {
         return None;
     }
-    let mime_type: &'static [u8] =
-        if url.ends_with(".svg") || url.ends_with(".svgz") { b"image/svg+xml" } else { b"" };
-    let source = ImageCacheKey::URL(url.into());
-    load_cached(source.clone(), || {
-        Some(EncodedImage {
-            source,
-            kind: EncodedImageKind::Html,
-            format: Slice::from_slice(mime_type),
-            size: IntSize::default(),
-        })
+    load_html_cached(Some(context), &ImageCacheKey::URL(url.into()), || {
+        Some(super::HTMLImage::new(url))
     })
 }
 
-/// Hands `data`, the encoded data of `source`, to the browser to decode.
+/// Returns the browser image of `key`, made with `create` unless it's in the cache.
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std"))]
+fn load_html_cached(
+    context: Option<&SlintContext>,
+    key: &ImageCacheKey,
+    create: impl FnOnce() -> Option<super::HTMLImage>,
+) -> Option<super::ImageInner> {
+    // The browser keeps its own cache; this only bounds the number of DOM elements.
+    const WEIGHT: usize = 512;
+    super::cache::cached_in(context, key, || Some((create()?, WEIGHT)))
+        .map(super::ImageInner::HTMLImage)
+}
+
+/// Hands `data` to the browser to decode.
 #[cfg(all(
     target_arch = "wasm32",
     not(target_os = "emscripten"),
     feature = "std",
     not(feature = "image-decoders")
 ))]
-fn load_html(source: ImageCacheKey, data: &[u8], extension: &[u8]) -> Option<EncodedImage> {
+fn load_html(data: &[u8], extension: &[u8]) -> Option<super::HTMLImage> {
     let mime_type = core::str::from_utf8(extension)
         .ok()
         .and_then(super::image_mime_type_from_extension)
@@ -471,13 +492,5 @@ fn load_html(source: ImageCacheKey, data: &[u8], extension: &[u8]) -> Option<Enc
         crate::debug_log!("Compressed SVG (.svgz) is not supported on the web");
         return None;
     }
-    let encoded = EncodedImage {
-        source,
-        kind: EncodedImageKind::Html,
-        format: Slice::from_slice(mime_type.as_bytes()),
-        size: IntSize::default(),
-    };
-    // Fails early if the browser rejects the data.
-    encoded.html_image()?;
-    Some(encoded)
+    super::HTMLImage::new_from_data(data, mime_type)
 }

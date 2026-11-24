@@ -82,8 +82,7 @@ type TextPoint = euclid::Point2D<i32, PhysicalPx>;
 use fonts::with_font;
 
 #[cfg(feature = "std")]
-type DecodedImageCache =
-    i_slint_core::item_rendering::ItemCache<Option<Option<Rc<SharedImageBuffer>>>>;
+type DecodedImageCache = i_slint_core::item_rendering::ItemCache<Option<Rc<SharedImageBuffer>>>;
 
 #[derive(Copy, Clone, Debug)]
 struct RotationInfo {
@@ -2563,7 +2562,9 @@ impl<'a, T: RasterCommandSink> SoftwareItemRenderer<'a, T> {
                 )
                 .round()
                 .cast();
-                if let Some(buffer) = image_inner.render_to_buffer(Some(svg_target_size)) {
+                if let Some(buffer) =
+                    image_inner.render_to_buffer(Some(svg_target_size), self.window.context())
+                {
                     let buf_size = buffer.size().cast::<f32>();
 
                     let alpha = if colorize.alpha() > 0 {
@@ -2962,21 +2963,19 @@ impl<T: RasterCommandSink> i_slint_core::item_rendering::ItemRenderer
         size: LogicalSize,
         _: &CachedRenderingData,
     ) {
+        let context = self.window.context();
         let geom = LogicalRect::from(size);
         if self.should_draw(&geom) {
-            let source = image.source();
+            let source = image.source(context);
 
             let image_inner: &ImageInner = (&source).into();
             #[cfg(feature = "std")]
             let decoded = self
                 .decoded_image_cache
                 .get_or_update_cache_entry(_self_rc, || {
-                    <&ImageInner>::from(&image.source()).decode_shared()
+                    <&ImageInner>::from(&image.source(context)).decode_shared(context)
                 })
-                .map(|buffer| match buffer {
-                    Some(buffer) => ImageInner::EmbeddedImage(SharedImageBuffer::clone(&buffer)),
-                    None => ImageInner::None,
-                });
+                .map(|buffer| ImageInner::EmbeddedImage(SharedImageBuffer::clone(&buffer)));
             #[cfg(not(feature = "std"))]
             let decoded = None::<ImageInner>;
             if let ImageInner::NineSlice(nine) = image_inner {

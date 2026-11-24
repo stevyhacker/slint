@@ -27,6 +27,12 @@ pub struct HTMLImage {
     object_url: Option<String>,
 }
 
+impl core::fmt::Debug for HTMLImage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("HTMLImage").field(&self.source()).finish()
+    }
+}
+
 impl HTMLImage {
     /// Creates an element that loads `url`.
     pub fn new(url: &str) -> Self {
@@ -112,6 +118,11 @@ impl HTMLImage {
                 self.dom_element.natural_height(),
             )),
         }
+    }
+
+    /// Returns the URL that the element loads.
+    pub fn source(&self) -> alloc::string::String {
+        self.dom_element.src()
     }
 
     /// Returns true if the image is an SVG.
