@@ -78,9 +78,15 @@ Keep the project discovery and documentation lookup instructions aligned across 
 Cursor and Antigravity have their manifests at the `ai-plugins` root.
 
 `mcp/slint-preview` contains the MCP App that shows `.slint` source as a live preview in the conversation.
-The [release mirror](https://github.com/slint-ui/ai-plugins) syncs from `release/1` and selects `release` in `mcp/slint-preview/channel.json`.
-The [nightly mirror](https://github.com/slint-ui/ai-plugins-nightly) syncs from `master` and selects `snapshot`.
-Its marketplace name is `slint-nightly`.
+The "Publish AI plugins" workflow pushes the plugin to two mirrors every day.
+Run the workflow by hand to publish right away.
+It runs `scripts/prepare_ai_plugins.sh` from `master` for both mirrors, so the script must also handle the layout of `ai-plugins/` on `release/1`.
+The [release mirror](https://github.com/slint-ui/ai-plugins) gets `release/1` and selects `release` in `mcp/slint-preview/channel.json`.
+Its `claude-directory` branch holds a copy of `mcp/` at the root, with its own README, for the Claude plugin directory.
+The [nightly mirror](https://github.com/slint-ui/ai-plugins-nightly) gets `master` and selects `snapshot`.
+Its marketplace name is `slint-nightly`, and its version has a `-nightly.<UTC timestamp>` suffix.
+To see what the script would publish, run it against a clean clone of a mirror and look at the diff.
+Run on another branch, the workflow lists the files it would change, but only pushes from `master`.
 
 The MCP server checks and renders source with a separate software Wasm build before publication.
 Use Node.js 24 to build and run the checker.
