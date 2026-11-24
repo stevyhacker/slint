@@ -71,12 +71,6 @@ OpaqueImageVTable_static! {
     pub static ANIMATED_IMAGE_VT for AnimatedImage
 }
 
-#[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
-OpaqueImageVTable_static! {
-    /// VTable for RC wrapped WGPU textures.
-    pub static WGPU_TEXTURE_VT for WGPUTexture
-}
-
 /// SharedPixelBuffer is a container for storing image data as pixels. It is
 /// internally reference counted and cheap to clone.
 ///
@@ -551,7 +545,7 @@ pub enum WGPUTexture {
 }
 
 #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
-impl OpaqueImage for WGPUTexture {
+impl WGPUTexture {
     fn size(&self) -> IntSize {
         match self {
             #[cfg(feature = "unstable-wgpu-29")]
@@ -565,9 +559,6 @@ impl OpaqueImage for WGPUTexture {
                 (size.width, size.height).into()
             }
         }
-    }
-    fn cache_key(&self) -> ImageCacheKey {
-        ImageCacheKey::Invalid
     }
 }
 
@@ -594,10 +585,10 @@ pub enum ImageInner {
     BorrowedOpenGLTexture(BorrowedOpenGLTexture) = 6,
     NineSlice(vtable::VRc<OpaqueImageVTable, NineSliceImage>) = 7,
     #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
-    WGPUTexture(vtable::VRc<OpaqueImageVTable, WGPUTexture>) = 8,
+    WGPUTexture(WGPUTexture) = 8,
     AnimatedImage(vtable::VRc<OpaqueImageVTable, AnimatedImage>) = 9,
     #[cfg(feature = "owned-pre-rendered-resources")]
-    OwnedTextures(alloc::rc::Rc<StaticTextures<OwnedStorage>>) = 10,
+    OwnedTextures(alloc::sync::Arc<StaticTextures<OwnedStorage>>) = 10,
     StaticTextures(&'static StaticTextures<StaticStorage>) = 11,
 }
 
@@ -866,7 +857,7 @@ impl PartialEq for ImageInner {
             (Self::Svg(l0), Self::Svg(r0)) => vtable::VRc::ptr_eq(l0, r0),
             (Self::StaticTextures(l0), Self::StaticTextures(r0)) => core::ptr::eq(*l0, *r0),
             #[cfg(feature = "owned-pre-rendered-resources")]
-            (Self::OwnedTextures(l0), Self::OwnedTextures(r0)) => alloc::rc::Rc::ptr_eq(l0, r0),
+            (Self::OwnedTextures(l0), Self::OwnedTextures(r0)) => alloc::sync::Arc::ptr_eq(l0, r0),
             #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
             (Self::HTMLImage(l0), Self::HTMLImage(r0)) => vtable::VRc::ptr_eq(l0, r0),
             (Self::BackendStorage(l0), Self::BackendStorage(r0)) => vtable::VRc::ptr_eq(l0, r0),
@@ -874,7 +865,7 @@ impl PartialEq for ImageInner {
             (Self::NineSlice(l), Self::NineSlice(r)) => l.0 == r.0 && l.1 == r.1,
             (Self::AnimatedImage(l), Self::AnimatedImage(r)) => **l == **r,
             #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
-            (Self::WGPUTexture(l), Self::WGPUTexture(r)) => **l == **r,
+            (Self::WGPUTexture(l), Self::WGPUTexture(r)) => l == r,
             _ => false,
         }
     }
@@ -1187,11 +1178,7 @@ impl Image {
     #[cfg(feature = "unstable-wgpu-29")]
     pub fn to_wgpu_29_texture(&self) -> Option<wgpu_29::Texture> {
         match &self.0 {
-            ImageInner::WGPUTexture(texture) => match &**texture {
-                WGPUTexture::WGPU29Texture(texture) => Some(texture.clone()),
-                #[allow(unreachable_patterns)]
-                _ => None,
-            },
+            ImageInner::WGPUTexture(WGPUTexture::WGPU29Texture(texture)) => Some(texture.clone()),
             _ => None,
         }
     }
@@ -1204,11 +1191,7 @@ impl Image {
     #[cfg(feature = "unstable-wgpu-30")]
     pub fn to_wgpu_30_texture(&self) -> Option<wgpu_30::Texture> {
         match &self.0 {
-            ImageInner::WGPUTexture(texture) => match &**texture {
-                WGPUTexture::WGPU30Texture(texture) => Some(texture.clone()),
-                #[allow(unreachable_patterns)]
-                _ => None,
-            },
+            ImageInner::WGPUTexture(WGPUTexture::WGPU30Texture(texture)) => Some(texture.clone()),
             _ => None,
         }
     }
