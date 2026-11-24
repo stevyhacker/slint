@@ -52,6 +52,10 @@ AVIF, BMP, DDS, Farbfeld, GIF, HDR, ICO, JPEG, EXR, PNG, PNM, QOI, TGA, TIFF, We
 On the web, the browser decodes images, so every format the browser supports works.
 Compressed SVG (`.svgz`) is the exception: browsers don't render it.
 
+Slint reads only the size of an image file when it loads it, and decodes the image the first time it's drawn.
+A decoded image stays in memory while it's shown.
+Slint also keeps some images that aren't shown anymore, so that showing them again doesn't decode them again.
+
 <Tabs syncKey="dev-language">
 <TabItem label="Rust" icon="seti:rust">
 In Rust, properties or struct fields of the image type are mapped to <LangRefLink lang="rust-slint" relpath="struct.Image">`slint::Image`</LangRefLink>.
