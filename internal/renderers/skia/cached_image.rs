@@ -94,7 +94,7 @@ pub(crate) fn as_skia_image(
         _ => {
             let key = ImageCacheKey::new(image_inner).unwrap_or(ImageCacheKey::Invalid);
             cache::cached(context, &key, || {
-                let buffer = image_inner.render_to_buffer(None, context)?;
+                let buffer = image_inner.render_to_new_buffer(None, context)?;
                 let image = image_buffer_to_skia_image(&buffer)?;
                 let weight = image.image_info().compute_min_byte_size();
                 Some((image, weight))

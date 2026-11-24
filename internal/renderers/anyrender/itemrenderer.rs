@@ -1218,7 +1218,7 @@ fn load_image(
             ImageCacheKey::new(image_inner),
             ImageVariant::Full,
             || {
-                let buffer = image_inner.render_to_buffer(None, context)?;
+                let buffer = image_inner.render_to_new_buffer(None, context)?;
                 image_buffer_to_peniko_image(&buffer)
             },
         ),

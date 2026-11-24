@@ -283,6 +283,33 @@ mod tests {
 
     #[cfg(feature = "image-decoders")]
     #[test]
+    fn new_buffers_of_still_images_are_not_kept() {
+        static PNG: &[u8] =
+            include_bytes!("../../../../tests/screenshots/cases/image/tiny-1x1.png");
+        let context = SlintContext::new(alloc::boxed::Box::new(crate::testing::NoWindowPlatform));
+        let image = crate::graphics::load_image_from_embedded_data(
+            &context,
+            crate::slice::Slice::from_slice(PNG),
+            crate::slice::Slice::from_slice(b"png"),
+        );
+        let has_pixels = || {
+            context
+                .0
+                .image_cache
+                .0
+                .borrow()
+                .entries
+                .keys()
+                .any(|key| key.data_type == TypeId::of::<SharedImageBuffer>())
+        };
+        assert!(image.0.render_to_new_buffer(None, &context).is_some());
+        assert!(!has_pixels());
+        assert!(image.0.render_to_buffer(None, &context).is_some());
+        assert!(has_pixels());
+    }
+
+    #[cfg(feature = "image-decoders")]
+    #[test]
     fn test_path_cache_invalidation() {
         use crate::graphics::Rgba8Pixel;
         let temp_dir = tempfile::tempdir().unwrap();

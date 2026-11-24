@@ -668,6 +668,22 @@ impl ImageInner {
         self.render_to_buffer_in(target_size_for_scalable_source, Some(context))
     }
 
+    /// Like [`Self::render_to_buffer`], but the decoded pixels of a still image aren't kept
+    /// in the image cache. For a renderer that caches what it makes from the buffer.
+    pub fn render_to_new_buffer(
+        &self,
+        target_size_for_scalable_source: Option<euclid::Size2D<u32, PhysicalPx>>,
+        context: &crate::SlintContext,
+    ) -> Option<SharedImageBuffer> {
+        match self {
+            #[cfg(feature = "std")]
+            ImageInner::Encoded(encoded) if encoded.kind() == EncodedImageKind::Raster => {
+                encoded.decode()
+            }
+            _ => self.render_to_buffer(target_size_for_scalable_source, context),
+        }
+    }
+
     /// Like [`Self::render_to_buffer`], and without a context, nothing is cached.
     #[cfg_attr(not(feature = "std"), allow(clippy::only_used_in_recursion))]
     fn render_to_buffer_in(
