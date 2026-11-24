@@ -14,6 +14,7 @@ use super::{ImageCacheKey, SharedImageBuffer};
 use crate::SlintContext;
 use alloc::rc::Rc;
 use core::any::{Any, TypeId};
+use core::hash::{Hash, Hasher};
 use std::collections::HashMap;
 
 /// Bytes of entries that nothing outside the cache holds, that the cache keeps
@@ -23,8 +24,56 @@ const UNUSED_BUDGET: usize = 5 * 1024 * 1024;
 /// What's cached when making an entry failed, so that it isn't tried again on every use.
 struct Failed;
 
+/// Tells apart what's made of the same type from the same image,
+/// such as the sizes an SVG is rasterized at.
+trait Variant: Any {
+    fn dyn_eq(&self, other: &dyn Variant) -> bool;
+    fn dyn_hash(&self, state: &mut dyn Hasher);
+}
+
+impl<V: Hash + Eq + 'static> Variant for V {
+    fn dyn_eq(&self, other: &dyn Variant) -> bool {
+        (other as &dyn Any).downcast_ref::<V>() == Some(self)
+    }
+    fn dyn_hash(&self, mut state: &mut dyn Hasher) {
+        self.hash(&mut state);
+    }
+}
+
+#[derive(Clone)]
+struct Key {
+    source: ImageCacheKey,
+    /// The type of what's made from the source.
+    data_type: TypeId,
+    variant: Option<Rc<dyn Variant>>,
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.data_type == other.data_type
+            && match (&self.variant, &other.variant) {
+                (None, None) => true,
+                (Some(l), Some(r)) => l.dyn_eq(&**r),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Key {}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.source.hash(state);
+        self.data_type.hash(state);
+        if let Some(variant) = &self.variant {
+            variant.dyn_hash(state);
+        }
+    }
+}
+
 struct Entry {
-    /// The `T` of the key's `TypeId`, or [`Failed`].
+    /// The `T` of the key's `data_type`, or [`Failed`].
     data: Rc<dyn Any>,
     weight: usize,
     last_use: u64,
@@ -32,14 +81,14 @@ struct Entry {
 
 #[derive(Default)]
 struct Entries {
-    entries: HashMap<(ImageCacheKey, TypeId), Entry>,
+    entries: HashMap<Key, Entry>,
     /// The weight of all the entries, which bounds the weight of the unused ones.
     total_weight: usize,
     clock: u64,
 }
 
 impl Entries {
-    fn insert(&mut self, key: (ImageCacheKey, TypeId), entry: Entry) {
+    fn insert(&mut self, key: Key, entry: Entry) {
         self.total_weight += entry.weight;
         if let Some(old) = self.entries.insert(key, entry) {
             self.total_weight -= old.weight;
@@ -81,10 +130,9 @@ pub(crate) struct ImageCache(core::cell::RefCell<Entries>);
 impl ImageCache {
     fn cached<T: 'static>(
         &self,
-        key: &ImageCacheKey,
+        cache_key: Key,
         create: impl FnOnce() -> Option<(T, usize)>,
     ) -> Option<Rc<T>> {
-        let cache_key = (key.clone(), TypeId::of::<T>());
         let cached = {
             let mut entries = self.0.borrow_mut();
             entries.clock += 1;
@@ -131,14 +179,34 @@ pub fn cached<T: 'static>(
     cached_in(Some(context), key, create)
 }
 
+/// Like [`cached`], for one of several `T` made from the same image, told apart by `variant`.
+pub fn cached_variant<T: 'static, V: Hash + Eq + 'static>(
+    context: &SlintContext,
+    key: &ImageCacheKey,
+    variant: V,
+    create: impl FnOnce() -> Option<(T, usize)>,
+) -> Option<Rc<T>> {
+    cached_with(Some(context), key, Some(Rc::new(variant)), create)
+}
+
 /// Like [`cached`], and without a context, nothing is cached.
 pub(crate) fn cached_in<T: 'static>(
     context: Option<&SlintContext>,
     key: &ImageCacheKey,
     create: impl FnOnce() -> Option<(T, usize)>,
 ) -> Option<Rc<T>> {
+    cached_with(context, key, None, create)
+}
+
+fn cached_with<T: 'static>(
+    context: Option<&SlintContext>,
+    key: &ImageCacheKey,
+    variant: Option<Rc<dyn Variant>>,
+    create: impl FnOnce() -> Option<(T, usize)>,
+) -> Option<Rc<T>> {
     match context {
         Some(context) if *key != ImageCacheKey::Invalid => {
+            let key = Key { source: key.clone(), data_type: TypeId::of::<T>(), variant };
             context.0.image_cache.cached(key, create)
         }
         _ => create().map(|(data, _)| Rc::new(data)),
@@ -162,29 +230,33 @@ pub fn buffer_weight(buffer: &SharedImageBuffer) -> usize {
 mod tests {
     use super::*;
 
-    fn key(n: usize) -> ImageCacheKey {
+    fn source(n: usize) -> ImageCacheKey {
         static DATA: [u8; 8] = [0; 8];
         ImageCacheKey::EmbeddedData(crate::slice::Slice::from_slice(&DATA[n..=n]))
     }
 
+    fn key(n: usize) -> Key {
+        Key { source: source(n), data_type: TypeId::of::<u32>(), variant: None }
+    }
+
     fn is_cached(cache: &ImageCache, n: usize) -> bool {
-        cache.0.borrow().entries.contains_key(&(key(n), TypeId::of::<u32>()))
+        cache.0.borrow().entries.contains_key(&key(n))
     }
 
     #[test]
     fn shares_and_evicts_unused_beyond_budget() {
         let cache = ImageCache::default();
         let third = UNUSED_BUDGET / 3 + 1;
-        let first = cache.cached(&key(1), || Some((1u32, third))).unwrap();
-        assert!(Rc::ptr_eq(&first, &cache.cached(&key(1), || None::<(u32, _)>).unwrap()));
+        let first = cache.cached(key(1), || Some((1u32, third))).unwrap();
+        assert!(Rc::ptr_eq(&first, &cache.cached(key(1), || None::<(u32, _)>).unwrap()));
         drop(first);
-        cache.cached(&key(2), || Some((2u32, third))).unwrap();
-        cache.cached(&key(3), || Some((3u32, third))).unwrap();
+        cache.cached(key(2), || Some((2u32, third))).unwrap();
+        cache.cached(key(3), || Some((3u32, third))).unwrap();
         cache.trim();
         // The least recently used of the three unused images is gone.
         assert!(!is_cached(&cache, 1) && is_cached(&cache, 2) && is_cached(&cache, 3));
         // An image in use doesn't count, even beyond the budget.
-        let huge = cache.cached(&key(4), || Some((4u32, UNUSED_BUDGET * 2))).unwrap();
+        let huge = cache.cached(key(4), || Some((4u32, UNUSED_BUDGET * 2))).unwrap();
         assert!(is_cached(&cache, 2) && is_cached(&cache, 3) && is_cached(&cache, 4));
         drop(huge);
         cache.trim();
@@ -194,8 +266,19 @@ mod tests {
     #[test]
     fn failures_are_cached() {
         let cache = ImageCache::default();
-        assert!(cache.cached(&key(5), || None::<(u32, usize)>).is_none());
-        assert!(cache.cached::<u32>(&key(5), || unreachable!()).is_none());
+        assert!(cache.cached(key(5), || None::<(u32, usize)>).is_none());
+        assert!(cache.cached::<u32>(key(5), || unreachable!()).is_none());
+    }
+
+    #[test]
+    fn variants_are_separate_entries() {
+        let cache = ImageCache::default();
+        let variant = |size: u32| Key { variant: Some(Rc::new(size)), ..key(6) };
+        let small = cache.cached(variant(16), || Some((16u32, 0))).unwrap();
+        let large = cache.cached(variant(32), || Some((32u32, 0))).unwrap();
+        assert_eq!((*small, *large), (16, 32));
+        assert!(Rc::ptr_eq(&small, &cache.cached(variant(16), || None::<(u32, _)>).unwrap()));
+        assert!(cache.cached(key(6), || None::<(u32, usize)>).is_none());
     }
 
     #[cfg(feature = "image-decoders")]
