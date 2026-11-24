@@ -20,10 +20,7 @@ use crate::items::{ImageFit, ImageHorizontalAlignment, ImageTiling, ImageVertica
 use num_traits::Float;
 
 mod animated;
-#[cfg(any(
-    feature = "image-decoders",
-    all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
-))]
+#[cfg(feature = "std")]
 pub mod cache;
 pub use animated::AnimatedImage;
 #[cfg(all(
@@ -31,10 +28,16 @@ pub use animated::AnimatedImage;
     any(not(target_arch = "wasm32"), target_os = "emscripten")
 ))]
 pub(crate) use animated::{Frame, FrameDecoder};
+mod encoded;
+pub use encoded::{EncodedImage, EncodedImageKind};
 #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
 mod htmlimage;
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+pub use htmlimage::HTMLImage;
 #[cfg(feature = "svg")]
 mod svg;
+#[cfg(feature = "svg")]
+pub use svg::ParsedSVG;
 
 #[allow(missing_docs)]
 #[cfg_attr(not(feature = "ffi"), i_slint_core_macros::remove_extern)]
@@ -49,26 +52,9 @@ pub struct OpaqueImageVTable {
     cache_key: extern "C" fn(VRef<OpaqueImageVTable>) -> ImageCacheKey,
 }
 
-#[cfg(feature = "svg")]
 OpaqueImageVTable_static! {
-    /// VTable for RC wrapped SVG helper struct.
-    pub static PARSED_SVG_VT for svg::ParsedSVG
-}
-
-#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
-OpaqueImageVTable_static! {
-    /// VTable for RC wrapped HtmlImage helper struct.
-    pub static HTML_IMAGE_VT for htmlimage::HTMLImage
-}
-
-OpaqueImageVTable_static! {
-    /// VTable for RC wrapped SVG helper struct.
+    /// VTable for RC wrapped nine-slice images.
     pub static NINE_SLICE_VT for NineSliceImage
-}
-
-OpaqueImageVTable_static! {
-    /// VTable for RC wrapped animated images.
-    pub static ANIMATED_IMAGE_VT for AnimatedImage
 }
 
 /// SharedPixelBuffer is a container for storing image data as pixels. It is
@@ -463,53 +449,87 @@ impl CachedPath {
     }
 }
 
-/// ImageCacheKey encapsulates the different ways of indexing images in the
-/// cache of decoded images.
-#[derive(PartialEq, Eq, Debug, Hash, Clone)]
+/// Where the encoded data of an image is.
+/// It identifies the image in the [image cache](cache).
+#[derive(Clone)]
 #[repr(u8)]
 pub enum ImageCacheKey {
-    /// This variant indicates that no image cache key can be created for the image.
-    /// For example this is the case for programmatically created images.
+    /// The image isn't loaded from encoded data, for example it's made from pixels.
     Invalid = 0,
+    /// A file, with its modification time.
     #[cfg(any(feature = "std", feature = "ffi"))]
-    /// The image is identified by its path on the file system and the last modification time stamp.
     Path(CachedPath) = 1,
-    /// The image is identified by a URL.
+    /// A URL that the browser loads.
     #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
     URL(SharedString) = 2,
-    /// The image is identified by the static address of its encoded data.
-    EmbeddedData(usize) = 3,
+    /// Data embedded in the binary, identified by its address.
+    EmbeddedData(Slice<'static, u8>) = 3,
+    /// Data in memory, identified by its address.
+    Data(SharedVector<u8>) = 4,
+}
+
+impl PartialEq for ImageCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Invalid, Self::Invalid) => true,
+            #[cfg(any(feature = "std", feature = "ffi"))]
+            (Self::Path(l), Self::Path(r)) => l == r,
+            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+            (Self::URL(l), Self::URL(r)) => l == r,
+            (Self::EmbeddedData(l), Self::EmbeddedData(r)) => {
+                core::ptr::eq(l.as_slice(), r.as_slice())
+            }
+            (Self::Data(l), Self::Data(r)) => core::ptr::eq(l.as_slice(), r.as_slice()),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ImageCacheKey {}
+
+impl core::hash::Hash for ImageCacheKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Self::Invalid => {}
+            #[cfg(any(feature = "std", feature = "ffi"))]
+            Self::Path(path) => path.hash(state),
+            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+            Self::URL(url) => url.hash(state),
+            Self::EmbeddedData(data) => (data.as_ptr(), data.len()).hash(state),
+            Self::Data(data) => (data.as_slice().as_ptr(), data.len()).hash(state),
+        }
+    }
+}
+
+impl core::fmt::Debug for ImageCacheKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Invalid => f.write_str("Invalid"),
+            #[cfg(any(feature = "std", feature = "ffi"))]
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+            Self::URL(url) => f.debug_tuple("URL").field(url).finish(),
+            Self::EmbeddedData(data) => {
+                write!(f, "EmbeddedData({:p}, {})", data.as_ptr(), data.len())
+            }
+            Self::Data(data) => write!(f, "Data({:p}, {})", data.as_slice().as_ptr(), data.len()),
+        }
+    }
 }
 
 impl ImageCacheKey {
-    /// Returns a new cache key if decoded image data can be stored in image cache for
-    /// the given ImageInner.
+    /// Returns the key of what renderers make from `resource`, if it has one.
     pub fn new(resource: &ImageInner) -> Option<Self> {
         let key = match resource {
-            ImageInner::None => return None,
-            ImageInner::EmbeddedImage { cache_key, .. } => cache_key.clone(),
+            ImageInner::Encoded(encoded) => encoded.source().clone(),
             ImageInner::StaticTextures(textures) => {
-                Self::from_embedded_image_data(textures.data.as_slice())
+                Self::EmbeddedData(Slice::from_slice(textures.data.as_slice()))
             }
-            #[cfg(feature = "svg")]
-            ImageInner::Svg(parsed_svg) => parsed_svg.cache_key().clone(),
-            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
-            ImageInner::HTMLImage(htmlimage) => Self::URL(htmlimage.source().into()),
-            ImageInner::BackendStorage(x) => vtable::VRc::borrow(x).cache_key(),
-            ImageInner::BorrowedOpenGLTexture(..) => return None,
-            ImageInner::NineSlice(nine) => vtable::VRc::borrow(nine).cache_key(),
-            #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
-            ImageInner::WGPUTexture(..) => return None,
-            ImageInner::AnimatedImage(animated) => vtable::VRc::borrow(animated).cache_key(),
-            #[cfg(feature = "owned-pre-rendered-resources")]
-            ImageInner::OwnedTextures(..) => return None,
+            ImageInner::NineSlice(nine) => return Self::new(&nine.0),
+            _ => return None,
         };
         if matches!(key, ImageCacheKey::Invalid) { None } else { Some(key) }
-    }
-
-    /// Returns a cache key for static embedded image data.
-    pub fn from_embedded_image_data(data: &'static [u8]) -> Self {
-        Self::EmbeddedData(data.as_ptr() as usize)
     }
 }
 
@@ -562,9 +582,8 @@ impl WGPUTexture {
     }
 }
 
-/// A resource is a reference to binary data, for example images. They can be accessible on the file
-/// system or embedded in the resulting binary. Or they might be URLs to a web server and a downloaded
-/// is necessary before they can be used.
+/// The data of an [`Image`]. It doesn't hold anything that's local to a thread:
+/// what's loaded or decoded from encoded data is in the [image cache](cache).
 /// cbindgen:prefix-with-name
 #[derive(Clone, Debug, Default)]
 #[repr(u8)]
@@ -573,57 +592,40 @@ pub enum ImageInner {
     /// A resource that does not represent any data.
     #[default]
     None = 0,
-    EmbeddedImage {
-        cache_key: ImageCacheKey,
-        buffer: SharedImageBuffer,
-    } = 1,
-    #[cfg(feature = "svg")]
-    Svg(vtable::VRc<OpaqueImageVTable, svg::ParsedSVG>) = 2,
-    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
-    HTMLImage(vtable::VRc<OpaqueImageVTable, htmlimage::HTMLImage>) = 4,
-    BackendStorage(vtable::VRc<OpaqueImageVTable>) = 5,
+    EmbeddedImage(SharedImageBuffer) = 1,
     BorrowedOpenGLTexture(BorrowedOpenGLTexture) = 6,
     NineSlice(vtable::VRc<OpaqueImageVTable, NineSliceImage>) = 7,
     #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
     WGPUTexture(WGPUTexture) = 8,
-    AnimatedImage(vtable::VRc<OpaqueImageVTable, AnimatedImage>) = 9,
     #[cfg(feature = "owned-pre-rendered-resources")]
     OwnedTextures(alloc::sync::Arc<StaticTextures<OwnedStorage>>) = 10,
     StaticTextures(&'static StaticTextures<StaticStorage>) = 11,
+    Encoded(EncodedImage) = 12,
 }
 
-#[cfg(any(
-    feature = "image-decoders",
-    all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
-))]
-#[derive(Clone, Copy)]
-pub(crate) enum ImageData<'a> {
+/// Encoded image data, which an animation can keep without a copy.
+#[cfg(any(feature = "svg", feature = "image-decoders"))]
+#[derive(Clone)]
+pub(crate) enum EncodedData {
     Static(&'static [u8]),
-    Borrowed(&'a [u8]),
-    /// Data that an animation can keep without a copy.
-    #[cfg(all(
-        feature = "image-decoders",
-        any(not(target_arch = "wasm32"), target_os = "emscripten")
-    ))]
-    Shared(&'a SharedVector<u8>),
+    Shared(SharedVector<u8>),
 }
 
-#[cfg(any(
-    feature = "image-decoders",
-    all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
-))]
-impl core::ops::Deref for ImageData<'_> {
+#[cfg(any(feature = "svg", feature = "image-decoders"))]
+impl core::ops::Deref for EncodedData {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
             Self::Static(data) => data,
-            Self::Borrowed(data) => data,
-            #[cfg(all(
-                feature = "image-decoders",
-                any(not(target_arch = "wasm32"), target_os = "emscripten")
-            ))]
             Self::Shared(data) => data,
         }
+    }
+}
+
+#[cfg(any(feature = "svg", feature = "image-decoders"))]
+impl AsRef<[u8]> for EncodedData {
+    fn as_ref(&self) -> &[u8] {
+        self
     }
 }
 
@@ -641,11 +643,8 @@ impl ImageInner {
     #[cfg(feature = "std")]
     fn path(&self) -> Option<&SharedString> {
         match self {
-            ImageInner::EmbeddedImage { cache_key, .. } => cache_key.path(),
-            ImageInner::AnimatedImage(animated) => animated.source_cache_key().path(),
+            ImageInner::Encoded(encoded) => encoded.source().path(),
             ImageInner::NineSlice(nine) => nine.0.path(),
-            #[cfg(feature = "svg")]
-            ImageInner::Svg(svg) => svg.cache_key().path(),
             _ => None,
         }
     }
@@ -661,17 +660,11 @@ impl ImageInner {
         _target_size_for_scalable_source: Option<euclid::Size2D<u32, PhysicalPx>>,
     ) -> Option<SharedImageBuffer> {
         match self {
-            ImageInner::EmbeddedImage { buffer, .. } => Some(buffer.clone()),
-            #[cfg(feature = "svg")]
-            ImageInner::Svg(svg) => match svg.render(_target_size_for_scalable_source) {
-                Ok(b) => Some(b),
-                // Ignore error when rendering a 0x0 image, that's just an empty image
-                Err(resvg::usvg::Error::InvalidSize) => None,
-                Err(err) => {
-                    std::eprintln!("Error rendering SVG: {err}");
-                    None
-                }
-            },
+            ImageInner::EmbeddedImage(buffer) => Some(buffer.clone()),
+            #[cfg(feature = "std")]
+            ImageInner::Encoded(encoded) => {
+                encoded.render_to_buffer(_target_size_for_scalable_source)
+            }
             ImageInner::StaticTextures(ts) => {
                 Some(textures_to_buffer(ts.size, &ts.data, &ts.textures))
             }
@@ -680,7 +673,19 @@ impl ImageInner {
                 Some(textures_to_buffer(textures.size, &textures.data, &textures.textures))
             }
             ImageInner::NineSlice(nine) => nine.0.render_to_buffer(None),
-            ImageInner::AnimatedImage(animated) => Some(animated.first_frame_buffer().clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the pixels of a raster image that's decoded when drawn, shared through
+    /// the [image cache](cache): `Some(None)` if it fails to decode, and `None` for other images.
+    #[cfg(feature = "std")]
+    pub fn decode_shared(&self) -> Option<Option<alloc::rc::Rc<SharedImageBuffer>>> {
+        match self {
+            ImageInner::Encoded(encoded) if encoded.kind() == EncodedImageKind::Raster => {
+                Some(encoded.decode_shared())
+            }
+            ImageInner::NineSlice(nine) => nine.0.decode_shared(),
             _ => None,
         }
     }
@@ -688,10 +693,7 @@ impl ImageInner {
     /// Returns true if the image is an SVG (either backed by resvg or HTML image wrapper).
     pub fn is_svg(&self) -> bool {
         match self {
-            #[cfg(feature = "svg")]
-            Self::Svg(_) => true,
-            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
-            Self::HTMLImage(html_image) => html_image.is_svg(),
+            ImageInner::Encoded(encoded) => encoded.is_svg(),
             _ => false,
         }
     }
@@ -700,115 +702,16 @@ impl ImageInner {
     pub fn size(&self) -> IntSize {
         match self {
             ImageInner::None => Default::default(),
-            ImageInner::EmbeddedImage { buffer, .. } => buffer.size(),
+            ImageInner::EmbeddedImage(buffer) => buffer.size(),
             ImageInner::StaticTextures(StaticTextures { original_size, .. }) => *original_size,
             #[cfg(feature = "owned-pre-rendered-resources")]
             ImageInner::OwnedTextures(textures) => textures.original_size,
-            #[cfg(feature = "svg")]
-            ImageInner::Svg(svg) => svg.size(),
-            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
-            ImageInner::HTMLImage(htmlimage) => htmlimage.size().unwrap_or_default(),
-            ImageInner::BackendStorage(x) => vtable::VRc::borrow(x).size(),
             ImageInner::BorrowedOpenGLTexture(BorrowedOpenGLTexture { size, .. }) => *size,
             ImageInner::NineSlice(nine) => nine.0.size(),
             #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
             ImageInner::WGPUTexture(texture) => texture.size(),
-            ImageInner::AnimatedImage(animated) => animated.size(),
+            ImageInner::Encoded(encoded) => encoded.size(),
         }
-    }
-
-    /// Internal helper to abstract over either loading from a file or parsing internal data.
-    ///
-    /// This can create an `ImageInner` with a dangling cache key reference if used incorrectly,
-    /// which could lead to bad behavior. This constructor should be called from within
-    /// `ImageCache::lookup_image_in_cache_or_create`, or `ImageCacheKey::Invalid` should be
-    /// supplied.
-    #[cfg(any(
-        feature = "image-decoders",
-        all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
-    ))]
-    pub(crate) fn load_from_data_with_cache_key(
-        cache_key: ImageCacheKey,
-        data: ImageData<'_>,
-        format: Slice<'_, u8>,
-    ) -> Option<Self> {
-        // On the web, let the browser decode the image instead of shipping decoders in the binary.
-        #[cfg(not(feature = "image-decoders"))]
-        {
-            let _ = cache_key;
-            let mime_type = core::str::from_utf8(format.as_slice())
-                .ok()
-                .and_then(image_mime_type_from_extension)
-                .unwrap_or_else(|| {
-                    if data.starts_with(b"<?xml") || data.starts_with(b"<svg") {
-                        "image/svg+xml"
-                    } else {
-                        // An empty type makes the browser sniff the format from the data.
-                        ""
-                    }
-                });
-            if mime_type == "image/svg+xml" && data.starts_with(&[0x1f, 0x8b]) {
-                crate::debug_log!("Compressed SVG (.svgz) is not supported on the web");
-                return None;
-            }
-            htmlimage::HTMLImage::new_from_data(&data, mime_type)
-                .map(|html_image| ImageInner::HTMLImage(vtable::VRc::new(html_image)))
-        }
-
-        #[cfg(feature = "image-decoders")]
-        {
-            #[cfg(feature = "svg")]
-            if format.as_slice() == b"svg"
-                || format.as_slice() == b"svgz"
-                || (format.is_empty() && (data.starts_with(b"<?xml") || data.starts_with(b"<svg")))
-            {
-                return Some(ImageInner::Svg(vtable::VRc::new(
-                    svg::load_from_data(&data, cache_key).map_or_else(
-                        |svg_err| {
-                            crate::debug_log!("Error loading SVG: {}", svg_err);
-                            None
-                        },
-                        Some,
-                    )?,
-                )));
-            }
-
-            let format = std::str::from_utf8(format.as_slice())
-                .ok()
-                .and_then(image::ImageFormat::from_extension);
-            Self::decode_with_cache_key(cache_key, data, format)
-                .map_err(|err| crate::debug_log!("Error decoding embedded image: {err}"))
-                .ok()
-        }
-    }
-
-    #[cfg(feature = "image-decoders")]
-    pub(crate) fn decode_with_cache_key(
-        cache_key: ImageCacheKey,
-        data: ImageData<'_>,
-        format: Option<image::ImageFormat>,
-    ) -> image::ImageResult<Self> {
-        let format = format.or_else(|| image::guess_format(&data).ok());
-        // Files that the animation decoders reject may still decode as a still image.
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
-        if let Some(image) = format.and_then(|format| {
-            animated::load(cache_key.clone(), data, format)
-                .map_err(|err| {
-                    crate::debug_log!("Error decoding animation, showing a still image: {err}")
-                })
-                .ok()
-                .flatten()
-        }) {
-            return Ok(image);
-        }
-        let image = match format {
-            Some(format) => image::load_from_memory_with_format(&data, format),
-            None => image::load_from_memory(&data),
-        }?;
-        Ok(ImageInner::EmbeddedImage {
-            cache_key,
-            buffer: dynamic_image_to_shared_image_buffer(image),
-        })
     }
 }
 
@@ -849,23 +752,15 @@ impl PartialEq for ImageInner {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::None, Self::None) => true,
-            (
-                Self::EmbeddedImage { cache_key: l_cache_key, buffer: l_buffer },
-                Self::EmbeddedImage { cache_key: r_cache_key, buffer: r_buffer },
-            ) => l_cache_key == r_cache_key && l_buffer == r_buffer,
-            #[cfg(feature = "svg")]
-            (Self::Svg(l0), Self::Svg(r0)) => vtable::VRc::ptr_eq(l0, r0),
-            (Self::StaticTextures(l0), Self::StaticTextures(r0)) => core::ptr::eq(*l0, *r0),
+            (Self::EmbeddedImage(l), Self::EmbeddedImage(r)) => l == r,
+            (Self::StaticTextures(l), Self::StaticTextures(r)) => core::ptr::eq(*l, *r),
             #[cfg(feature = "owned-pre-rendered-resources")]
-            (Self::OwnedTextures(l0), Self::OwnedTextures(r0)) => alloc::sync::Arc::ptr_eq(l0, r0),
-            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
-            (Self::HTMLImage(l0), Self::HTMLImage(r0)) => vtable::VRc::ptr_eq(l0, r0),
-            (Self::BackendStorage(l0), Self::BackendStorage(r0)) => vtable::VRc::ptr_eq(l0, r0),
-            (Self::BorrowedOpenGLTexture(l0), Self::BorrowedOpenGLTexture(r0)) => l0 == r0,
+            (Self::OwnedTextures(l), Self::OwnedTextures(r)) => alloc::sync::Arc::ptr_eq(l, r),
+            (Self::BorrowedOpenGLTexture(l), Self::BorrowedOpenGLTexture(r)) => l == r,
             (Self::NineSlice(l), Self::NineSlice(r)) => l.0 == r.0 && l.1 == r.1,
-            (Self::AnimatedImage(l), Self::AnimatedImage(r)) => **l == **r,
             #[cfg(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30"))]
             (Self::WGPUTexture(l), Self::WGPUTexture(r)) => l == r,
+            (Self::Encoded(l), Self::Encoded(r)) => l == r,
             _ => false,
         }
     }
@@ -968,26 +863,6 @@ impl std::error::Error for LoadImageError {}
 ///
 /// let image = Image::from_rgba8_premultiplied(pixel_buffer);
 /// ```
-///
-/// ### Sending Image to a thread
-///
-/// `Image` is not [`Send`], because it uses internal cache that are local to the Slint thread.
-/// If you want to create image data in a thread and send that to slint, construct the
-/// [`SharedPixelBuffer`] in a thread, and send that to Slint's UI thread.
-///
-/// ```rust,no_run
-/// # use i_slint_core::graphics::{SharedPixelBuffer, Image, Rgba8Pixel};
-/// std::thread::spawn(move || {
-///     let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(640, 480);
-///     // ... fill the pixel_buffer with data as shown in the previous example ...
-///     slint::invoke_from_event_loop(move || {
-///         // this will run in the Slint's UI thread
-///         let image = Image::from_rgba8_premultiplied(pixel_buffer);
-///         // ... use the image, eg:
-///         // my_ui_handle.upgrade().unwrap().set_image(image);
-///     });
-/// });
-/// ```
 #[repr(transparent)]
 #[derive(Default, Clone, Debug, PartialEq, derive_more::From)]
 pub struct Image(pub(crate) ImageInner);
@@ -1004,30 +879,33 @@ impl Image {
     /// AVIF, BMP, DDS, Farbfeld, GIF, HDR, ICO, JPEG, EXR, PNG, PNM, QOI, TGA, TIFF, WebP)
     /// by enabling the `image-default-formats` cargo feature.
     ///
+    /// Only the size is read here. The file is read again and decoded when the image is drawn,
+    /// so it must stay in place, and an image whose data is damaged loads but draws nothing.
+    ///
     /// This function always fails on the web, where there is no file system.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self, LoadImageError> {
-        self::cache::IMAGE_CACHE.with(|global_cache| {
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
+        {
             let path: SharedString = path.to_str().ok_or(LoadImageError(()))?.into();
-            global_cache.borrow_mut().load_image_from_path(&path).ok_or(LoadImageError(()))
-        })
+            encoded::load_from_path(&path).map(Image).ok_or(LoadImageError(()))
+        }
+        #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+        {
+            let _ = path;
+            Err(LoadImageError(()))
+        }
     }
 
     /// Creates a new Image from the specified shared pixel buffer, where each pixel has three color
     /// channels (red, green and blue) encoded as u8.
     pub fn from_rgb8(buffer: SharedPixelBuffer<Rgb8Pixel>) -> Self {
-        Image(ImageInner::EmbeddedImage {
-            cache_key: ImageCacheKey::Invalid,
-            buffer: SharedImageBuffer::RGB8(buffer),
-        })
+        Image(ImageInner::EmbeddedImage(SharedImageBuffer::RGB8(buffer)))
     }
 
     /// Creates a new Image from the specified shared pixel buffer, where each pixel has four color
     /// channels (red, green, blue and alpha) encoded as u8.
     pub fn from_rgba8(buffer: SharedPixelBuffer<Rgba8Pixel>) -> Self {
-        Image(ImageInner::EmbeddedImage {
-            cache_key: ImageCacheKey::Invalid,
-            buffer: SharedImageBuffer::RGBA8(buffer),
-        })
+        Image(ImageInner::EmbeddedImage(SharedImageBuffer::RGBA8(buffer)))
     }
 
     /// Creates a new Image from the specified shared pixel buffer, where each pixel has four color
@@ -1036,10 +914,7 @@ impl Image {
     ///
     /// Only construct an Image with this function if you know that your pixels are encoded this way.
     pub fn from_rgba8_premultiplied(buffer: SharedPixelBuffer<Rgba8Pixel>) -> Self {
-        Image(ImageInner::EmbeddedImage {
-            cache_key: ImageCacheKey::Invalid,
-            buffer: SharedImageBuffer::RGBA8Premultiplied(buffer),
-        })
+        Image(ImageInner::EmbeddedImage(SharedImageBuffer::RGBA8Premultiplied(buffer)))
     }
 
     /// Creates a new Image from the specified shared pixel buffer, where each pixel is 16 bits:
@@ -1051,10 +926,7 @@ impl Image {
     /// This function is only available with the `image-pixel-format-rgb565` feature.
     #[cfg(feature = "image-pixel-format-rgb565")]
     pub fn from_rgb565(buffer: SharedPixelBuffer<Rgb565Pixel>) -> Self {
-        Image(ImageInner::EmbeddedImage {
-            cache_key: ImageCacheKey::Invalid,
-            buffer: SharedImageBuffer::RGB565(buffer),
-        })
+        Image(ImageInner::EmbeddedImage(SharedImageBuffer::RGB565(buffer)))
     }
 
     /// Creates a new Image from the specified shared pixel buffer, where each pixel is a single
@@ -1063,10 +935,7 @@ impl Image {
     /// This function is only available with the `image-pixel-format-gray8` feature.
     #[cfg(feature = "image-pixel-format-gray8")]
     pub fn from_gray8(buffer: SharedPixelBuffer<Gray8Pixel>) -> Self {
-        Image(ImageInner::EmbeddedImage {
-            cache_key: ImageCacheKey::Invalid,
-            buffer: SharedImageBuffer::Gray8(buffer),
-        })
+        Image(ImageInner::EmbeddedImage(SharedImageBuffer::Gray8(buffer)))
     }
 
     /// Returns the pixel buffer for the Image if available in RGB format without alpha.
@@ -1237,28 +1106,19 @@ impl Image {
         )
     ))]
     pub fn load_from_svg_data(buffer: &[u8]) -> Result<Self, LoadImageError> {
-        // On the web, the browser decodes the SVG.
         #[cfg(all(
             target_arch = "wasm32",
             not(target_os = "emscripten"),
             not(feature = "image-decoders")
         ))]
-        {
-            htmlimage::HTMLImage::new_from_data(buffer, "image/svg+xml")
-                .map(|html_image| Image(ImageInner::HTMLImage(vtable::VRc::new(html_image))))
-                .ok_or(LoadImageError(()))
-        }
-        #[cfg(any(
-            not(target_arch = "wasm32"),
-            target_os = "emscripten",
-            feature = "image-decoders"
-        ))]
-        {
-            let cache_key = ImageCacheKey::Invalid;
-            Ok(Image(ImageInner::Svg(vtable::VRc::new(
-                svg::load_from_data(buffer, cache_key).map_err(|_| LoadImageError(()))?,
-            ))))
-        }
+        let image = encoded::load_from_data(buffer, b"svg");
+        #[cfg(not(all(
+            target_arch = "wasm32",
+            not(target_os = "emscripten"),
+            not(feature = "image-decoders")
+        )))]
+        let image = encoded::load_svg_from_data(buffer);
+        image.map(Image).ok_or(LoadImageError(()))
     }
 
     /// Creates a new Image from a buffer in memory holding the content of an encoded image file,
@@ -1274,13 +1134,9 @@ impl Image {
         all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
     ))]
     pub fn load_from_data(data: &[u8], format: Option<&str>) -> Result<Self, LoadImageError> {
-        ImageInner::load_from_data_with_cache_key(
-            ImageCacheKey::Invalid,
-            ImageData::Borrowed(data),
-            Slice::from_slice(format.unwrap_or_default().as_bytes()),
-        )
-        .map(Image)
-        .ok_or(LoadImageError(()))
+        encoded::load_from_data(data, format.unwrap_or_default().as_bytes())
+            .map(Image)
+            .ok_or(LoadImageError(()))
     }
 
     /// Sets the nine-slice edges of the image.
@@ -1347,33 +1203,7 @@ pub fn load_image_from_data_uri(
     bytes: &[u8],
     format: &str,
 ) -> Result<Image, LoadImageError> {
-    // The browser loads images asynchronously, so every evaluation of the same data URI
-    // must share one image and its loading state: cache under the URI.
-    #[cfg(all(
-        target_arch = "wasm32",
-        not(target_os = "emscripten"),
-        not(feature = "image-decoders")
-    ))]
-    {
-        self::cache::IMAGE_CACHE.with(|global_cache| {
-            global_cache
-                .borrow_mut()
-                .load_image_from_data_uri(uri, bytes, format)
-                .ok_or(LoadImageError(()))
-        })
-    }
-    // Native decoding is synchronous; don't fill the cache with one-shot images.
-    #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten", feature = "image-decoders"))]
-    {
-        let _ = uri;
-        ImageInner::load_from_data_with_cache_key(
-            ImageCacheKey::Invalid,
-            ImageData::Borrowed(bytes),
-            format.as_bytes().into(),
-        )
-        .map(Image)
-        .ok_or(Default::default())
-    }
+    encoded::load_from_data_uri(uri, bytes, format.as_bytes()).map(Image).ok_or(LoadImageError(()))
 }
 
 /// Returns the MIME type for an image file extension, or None if the extension is unknown.
@@ -1489,9 +1319,7 @@ impl BorrowedOpenGLTextureBuilder {
 /// This is called by the interpreter and the generated code.
 #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std"))]
 pub fn load_as_html_image(url: &str) -> Result<Image, LoadImageError> {
-    self::cache::IMAGE_CACHE.with(|global_cache| {
-        global_cache.borrow_mut().load_as_html_image(url).ok_or(LoadImageError(()))
-    })
+    encoded::load_as_html_image(url).map(Image).ok_or(LoadImageError(()))
 }
 
 /// Load an image from an image embedded in the binary.
@@ -1501,9 +1329,15 @@ pub fn load_as_html_image(url: &str) -> Result<Image, LoadImageError> {
     all(target_arch = "wasm32", not(target_os = "emscripten"), feature = "std")
 ))]
 pub fn load_image_from_embedded_data(data: Slice<'static, u8>, format: Slice<'_, u8>) -> Image {
-    self::cache::IMAGE_CACHE.with(|global_cache| {
-        global_cache.borrow_mut().load_image_from_embedded_data(data, format).unwrap_or_default()
-    })
+    encoded::load_from_static_data(data.as_slice(), format.as_slice())
+        .map(Image)
+        .unwrap_or_default()
+}
+
+#[test]
+fn test_image_is_send_and_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<Image>();
 }
 
 #[test]

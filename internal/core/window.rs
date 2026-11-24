@@ -2069,6 +2069,8 @@ impl WindowInner {
                 })
             });
         self.has_active_animations.set(has_active_animations);
+        #[cfg(feature = "std")]
+        crate::graphics::cache::trim();
         Some(result)
     }
 
