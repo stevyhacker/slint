@@ -290,7 +290,7 @@ fn an_edition_before_a_behavior_change_warns() {
         let output = project.compile(&project.input(manifest), &[]);
         let message = stderr(&output);
         assert!(output.status.success(), "{message}");
-        let warning = "'edition' is 1.18, so the language behavior changes up to 1.19 don't apply";
+        let warning = "'edition' is 1.18, so the language behavior changes up to 1.20 don't apply";
         assert_eq!(message.matches(warning).count(), 1, "{message}");
         assert!(message.contains("slint-project.json"), "{message}");
 

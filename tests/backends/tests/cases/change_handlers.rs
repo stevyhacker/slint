@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 #[satchel::test]
 fn change_handlers_run_after_invoke_from_event_loop() {
     slint::slint! {
-        #[edition = "1.19"]
+        #[edition = "1.20"]
         export component App inherits Window {
             in property <int> input;
             out property <int> observed;

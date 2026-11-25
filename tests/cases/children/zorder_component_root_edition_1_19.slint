@@ -1,0 +1,93 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+
+//edition: 1.19
+
+// Before edition 1.20, a z set on the root element of a component has no effect.
+
+component Raised inherits TouchArea {
+    callback hit();
+    z: 5;
+    clicked => { hit(); }
+}
+
+component Card inherits TouchArea {
+    in property <int> id;
+    in property <int> top;
+    callback hit(int);
+    z: id == top ? 10 : 0;
+    clicked => { hit(id); }
+}
+
+export component TestCase inherits Rectangle {
+    width: 200phx;
+    height: 100phx;
+
+    in-out property <int> clicked-value;
+    in-out property <int> top-layer: 0;
+
+    // --- Section 1: the last `for` instance is on top, whatever its z (x: 0..100) ---
+    Rectangle {
+        x: 0phx; width: 100phx; height: 100phx;
+
+        for i in 3 : Card {
+            id: i;
+            top: root.top-layer;
+            hit(v) => { clicked-value = 10 + v; }
+        }
+    }
+
+    // --- Section 2: the later sibling is on top (x: 100..200) ---
+    Rectangle {
+        x: 100phx; width: 100phx; height: 100phx;
+
+        Raised {
+            hit => { clicked-value = 20; }
+        }
+        TouchArea {
+            clicked => { clicked-value = 21; }
+        }
+    }
+}
+
+/*
+```rust
+let instance = TestCase::new().unwrap();
+
+slint_testing::send_mouse_click(&instance, 50., 50.);
+assert_eq!(instance.get_clicked_value(), 12);
+instance.set_top_layer(1);
+slint_testing::send_mouse_click(&instance, 50., 50.);
+assert_eq!(instance.get_clicked_value(), 12);
+
+slint_testing::send_mouse_click(&instance, 150., 50.);
+assert_eq!(instance.get_clicked_value(), 21);
+```
+
+```cpp
+auto handle = TestCase::create();
+const TestCase &instance = *handle;
+
+slint_testing::send_mouse_click(&instance, 50., 50.);
+assert_eq(instance.get_clicked_value(), 12);
+instance.set_top_layer(1);
+slint_testing::send_mouse_click(&instance, 50., 50.);
+assert_eq(instance.get_clicked_value(), 12);
+
+slint_testing::send_mouse_click(&instance, 150., 50.);
+assert_eq(instance.get_clicked_value(), 21);
+```
+
+```js
+var instance = new slint.TestCase();
+
+slintlib.private_api.send_mouse_click(instance, 50., 50.);
+assert.equal(instance.clicked_value, 12);
+instance.top_layer = 1;
+slintlib.private_api.send_mouse_click(instance, 50., 50.);
+assert.equal(instance.clicked_value, 12);
+
+slintlib.private_api.send_mouse_click(instance, 150., 50.);
+assert.equal(instance.clicked_value, 21);
+```
+*/

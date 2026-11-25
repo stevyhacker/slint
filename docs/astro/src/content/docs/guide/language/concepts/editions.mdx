@@ -313,3 +313,49 @@ export component Example inherits Window {
     Card { title: "Quarterly Report"; }
 }
 ```
+
+#### `z` on the Root of a Component Is No Longer Ignored
+
+Before 1.20, a `z` on the root element of a component had no effect, which was a bug.
+Only a `z` set where you use the component worked.
+With edition 1.20, it works in both places.
+In this example, clicking a card brings it to the front.
+Before, the last card stayed on top:
+
+```slint
+component Card inherits Rectangle {
+    in property <bool> front;
+    callback clicked();
+    z: front ? 1 : 0;
+    width: 80px;
+    height: 60px;
+    border-width: 1px;
+    border-color: black;
+    background: white;
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+export component Example inherits Window {
+    width: 200px;
+    height: 100px;
+    in-out property <int> front-card;
+    for i in 3: Card {
+        x: 10px + i * 40px;
+        y: 20px;
+        front: i == root.front-card;
+        clicked => { root.front-card = i; }
+    }
+}
+```
+
+A constant `z` on the root of a component also changes the Tab order.
+Tab reaches an instance after its siblings with a lower `z`.
+A constant `z` set where you use the component already worked this way.
+
+If an instance now covers its siblings, or the Tab order changed, remove the `z` from the root of your component.
+To change it for one instance only, set `z` where you use the component; it overrides the `z` of the root.
+
+#### Changing `z` at Runtime Is No Longer Ignored
+
+Before 1.20, changing `z` with an assignment or a two-way binding had no effect when every sibling had a constant `z`, which was a bug.
+With edition 1.20, the element moves to its new place in the stacking order.

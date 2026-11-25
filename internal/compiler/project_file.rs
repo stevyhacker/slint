@@ -51,7 +51,7 @@ impl SlintEdition {
     pub const V1_19: Self = Self { major: 1, minor: 19 };
     pub const V1_20: Self = Self { major: 1, minor: 20 };
     /// The newest edition that changes the behavior of code that compiles without warnings.
-    pub const LATEST_BEHAVIOR_CHANGE: Self = Self::V1_19;
+    pub const LATEST_BEHAVIOR_CHANGE: Self = Self::V1_20;
 
     /// The warning for an edition that misses a newer behavior change, where `setting` is
     /// the name of the setting that selected the edition.
@@ -1264,7 +1264,7 @@ mod tests {
         let parse = |s: &str| s.parse::<SlintEdition>().unwrap();
         let warning = parse("1.18").behavior_change_warning("edition").unwrap();
         assert!(warning.contains(
-            "'edition' is 1.18, so the language behavior changes up to 1.19 don't apply"
+            "'edition' is 1.18, so the language behavior changes up to 1.20 don't apply"
         ));
         assert_eq!(SlintEdition::current().behavior_change_warning("edition"), None);
     }
